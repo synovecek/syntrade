@@ -1,0 +1,67 @@
+/* ============================================================
+   netlify/functions/google-trends.js
+   Google Trends integration.
+   Currently returns simulated data (seed-based, deterministic).
+   Ready for real pytrends/SerpAPI integration.
+   ============================================================ */
+
+exports.handler = async (event) => {
+  const headers = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
+  if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers, body: '' };
+
+  const symbol = (event.queryStringParameters?.symbol || 'AAPL').toUpperCase();
+
+  // Check if SerpAPI key is available for real Google Trends
+  const serpKey = process.env.SERPAPI_KEY || '';
+
+  if (serpKey) {
+    try {
+      const score = await fetchRealTrends(symbol, serpKey);
+      return { statusCode: 200, headers, body: JSON.stringify({ symbol, trendScore: score, method: 'serpapi', _demo: false }) };
+    } catch (e) {
+      console.warn('SerpAPI failed:', e.message);
+    }
+  }
+
+  // Simulated: seed-based pseudo-random but stable per symbol
+  const trendScore = simulatedTrend(symbol);
+  return {
+    statusCode: 200, headers,
+    body: JSON.stringify({
+      symbol,
+      trendScore,     // 0–100: 100 = peak interest
+      method: 'simulated',
+      message: 'Add SERPAPI_KEY for real Google Trends data.',
+      _demo: true,
+    }),
+  };
+};
+
+// ── REAL TRENDS via SerpAPI ───────────────────────────────
+async function fetchRealTrends(symbol, apiKey) {
+  const query = TREND_QUERY[symbol] || symbol;
+  const url   = `https://serpapi.com/search.json?engine=google_trends&q=${encodeURIComponent(query)}&data_type=TIMESERIES&api_key=${apiKey}`;
+  const resp  = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  if (!resp.ok) throw new Error('SerpAPI HTTP ' + resp.status);
+  const json = await resp.json();
+  const timeline = json.interest_over_time?.timeline_data || [];
+  if (!timeline.length) return 50;
+  const values = timeline.map(t => t.values?.[0]?.extracted_value || 0);
+  const avg    = values.reduce((a, b) => a + b, 0) / values.length;
+  const last   = values[values.length - 1];
+  // If last week is >1.5x average: spike
+  return Math.round(Math.min(100, (last / (avg || 1)) * 50));
+}
+
+// ── SIMULATED (seed-based) ────────────────────────────────
+function simulatedTrend(sym) {
+  const seed  = [...sym].reduce((a, c) => a + c.charCodeAt(0), 0);
+  const hour  = Math.floor(Date.now() / 3600000);
+  const noise = ((seed * hour) % 100 + 100) % 100;
+  return 30 + noise * 0.4;
+}
+
+const TREND_QUERY = {
+  AAPL: 'Apple stock', NVDA: 'NVIDIA stock', TSLA: 'Tesla stock',
+  'BTC-USD': 'Bitcoin price', 'GC=F': 'Gold price', 'CL=F': 'Oil price',
+};

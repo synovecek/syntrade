@@ -1,0 +1,92 @@
+/* ============================================================
+   netlify/functions/monitor.js
+   Scheduled function – runs every 15 minutes via cron.
+   schedule = "*/15 * * * *"  (set in netlify.toml)
+
+   Workflow:
+   1. Load watchlists from environment or simple shared store
+   2. Fetch market snapshots for all watched symbols
+   3. Calculate signals with calculateSignal()
+   4. If confidence >= threshold AND alert type allowed → send push
+   ============================================================ */
+
+const { calculateSignal } = require('./shared/signal');
+
+exports.handler = async (event, context) => {
+  console.log('[monitor] Scheduled run:', new Date().toISOString());
+
+  // In a real multi-user system you'd fetch watchlists from a DB.
+  // For this single-user PWA, we use DEFAULT_SYMBOLS as a fallback.
+  // The front-end also triggers its own refresh, so this is for background.
+  const symbols = (process.env.DEFAULT_SYMBOLS || 'AAPL,NVDA,TSLA,BTC-USD,GC=F,CL=F')
+    .split(',').map(s => s.trim()).filter(Boolean);
+  const threshold   = parseInt(process.env.DEFAULT_THRESHOLD || '85', 10);
+  const alertTypes  = (process.env.DEFAULT_ALERT_TYPES || 'BUY,SELL').split(',');
+
+  const baseUrl = process.env.URL || 'http://localhost:8888';
+
+  // Fetch snapshots
+  let snapshotData = {};
+  try {
+    const res = await fetch(`${baseUrl}/.netlify/functions/market-snapshot?symbols=${symbols.join(',')}`);
+    snapshotData = await res.json();
+  } catch (e) {
+    console.error('[monitor] market-snapshot failed:', e.message);
+    return { statusCode: 500, body: 'market-snapshot error' };
+  }
+
+  // Optionally enrich with news + macro
+  const enriched = await enrichWithSignals(snapshotData, symbols, baseUrl);
+
+  // Evaluate and push
+  const alerts = [];
+  for (const sym of symbols) {
+    const data = enriched[sym];
+    if (!data) continue;
+    const signal = calculateSignal(data);
+    if (signal.confidence >= threshold && alertTypes.includes(signal.action)) {
+      alerts.push({ symbol: sym, ...signal });
+    }
+  }
+
+  if (alerts.length > 0) {
+    console.log('[monitor] Sending', alerts.length, 'alert(s)');
+    await Promise.allSettled(alerts.map(alert =>
+      sendPush(alert, baseUrl)
+    ));
+  } else {
+    console.log('[monitor] No alerts this cycle.');
+  }
+
+  return {
+    statusCode: 200,
+    body: JSON.stringify({ ran: new Date().toISOString(), checked: symbols.length, alerts: alerts.length }),
+  };
+};
+
+async function enrichWithSignals(snapshotData, symbols, baseUrl) {
+  const enriched = { ...snapshotData };
+  await Promise.allSettled(symbols.map(async sym => {
+    try {
+      const [newsRes, macroRes] = await Promise.allSettled([
+        fetch(`${baseUrl}/.netlify/functions/news-sentiment?symbol=${sym}`).then(r => r.json()),
+        fetch(`${baseUrl}/.netlify/functions/macro`).then(r => r.json()),
+      ]);
+      if (enriched[sym]) {
+        if (newsRes.status === 'fulfilled') enriched[sym].newsSentiment = newsRes.value.sentimentScore;
+        if (macroRes.status === 'fulfilled') enriched[sym].macroRisk    = macroRes.value.macroRiskScore;
+      }
+    } catch {}
+  }));
+  return enriched;
+}
+
+async function sendPush(alert, baseUrl) {
+  try {
+    await fetch(`${baseUrl}/.netlify/functions/send-push`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(alert),
+    });
+  } catch (e) { console.error('[monitor] send-push failed:', e.message); }
+}
