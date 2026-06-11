@@ -14,5 +14,10 @@
   [headers.values]
     Cache-Control = "no-cache"
 
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
 [functions."monitor"]
   schedule = "*/15 * * * *"
